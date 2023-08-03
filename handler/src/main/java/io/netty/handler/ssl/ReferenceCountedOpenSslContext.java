@@ -32,6 +32,7 @@ import io.netty.util.ResourceLeakDetectorFactory;
 import io.netty.util.ResourceLeakTracker;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.FutureListener;
+import io.netty.util.internal.EmptyArrays;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
 import io.netty.util.internal.SuppressJava6Requirement;
@@ -227,6 +228,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         OpenSslPrivateKeyMethod privateKeyMethod = null;
         OpenSslAsyncPrivateKeyMethod asyncPrivateKeyMethod = null;
         OpenSslCertificateCompressionConfig certCompressionConfig = null;
+        Integer maxCertificateList = null;
 
         if (ctxOptions != null) {
             for (Map.Entry<SslContextOption<?>, Object> ctxOpt : ctxOptions) {
@@ -242,6 +244,8 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
                     asyncPrivateKeyMethod = (OpenSslAsyncPrivateKeyMethod) ctxOpt.getValue();
                 } else if (option == OpenSslContextOption.CERTIFICATE_COMPRESSION_ALGORITHMS) {
                     certCompressionConfig = (OpenSslCertificateCompressionConfig) ctxOpt.getValue();
+                } else if (option == OpenSslContextOption.MAX_CERTIFICATE_LIST_BYTES) {
+                    maxCertificateList = (Integer) ctxOpt.getValue();
                 } else {
                     logger.debug("Skipping unsupported " + SslContextOption.class.getSimpleName()
                             + ": " + ctxOpt.getKey());
@@ -345,6 +349,12 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
                         | SSL.SSL_OP_NO_TLSv1_1 | SSL.SSL_OP_NO_TLSv1_2;
             }
 
+            if (!tlsv13Supported) {
+                // Explicit disable TLSv1.3
+                // See https://github.com/netty/netty/issues/12968
+                options |= SSL.SSL_OP_NO_TLSv1_3;
+            }
+
             SSLContext.setOptions(ctx, options);
 
             // We need to enable SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER as the memory address may change between
@@ -359,7 +369,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
             List<String> nextProtoList = apn.protocols();
             /* Set next protocols for next protocol negotiation extension, if specified */
             if (!nextProtoList.isEmpty()) {
-                String[] appProtocols = nextProtoList.toArray(new String[0]);
+                String[] appProtocols = nextProtoList.toArray(EmptyArrays.EMPTY_STRINGS);
                 int selectorBehavior = opensslSelectorFailureBehavior(apn.selectorFailureBehavior());
 
                 switch (apn.protocol()) {
@@ -409,6 +419,9 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
                             throw new IllegalStateException();
                     }
                 }
+            }
+            if (maxCertificateList != null) {
+                SSLContext.setMaxCertList(ctx, maxCertificateList);
             }
             // Set the curves.
             SSLContext.setCurvesList(ctx, OpenSsl.NAMED_GROUPS);
@@ -648,10 +661,16 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
     protected static X509TrustManager chooseTrustManager(TrustManager[] managers) {
         for (TrustManager m : managers) {
             if (m instanceof X509TrustManager) {
+                X509TrustManager tm = (X509TrustManager) m;
                 if (PlatformDependent.javaVersion() >= 7) {
-                    return OpenSslX509TrustManagerWrapper.wrapIfNeeded((X509TrustManager) m);
+                    tm = OpenSslX509TrustManagerWrapper.wrapIfNeeded((X509TrustManager) m);
+                    if (useExtendedTrustManager(tm)) {
+                        // Wrap the TrustManager to provide a better exception message for users to debug hostname
+                        // validation failures.
+                        tm = new EnhancingX509ExtendedTrustManager(tm);
+                    }
                 }
-                return (X509TrustManager) m;
+                return tm;
             }
         }
         throw new IllegalStateException("no X509TrustManager found");

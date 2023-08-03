@@ -47,6 +47,7 @@ import io.netty.util.concurrent.Promise;
 import io.netty.util.concurrent.PromiseNotifier;
 import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
+import io.netty.util.internal.ThrowableUtil;
 import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
@@ -1037,7 +1038,9 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
             }
 
             for (;;) {
-                ByteBuffer out0 = out.nioBuffer(out.writerIndex(), out.writableBytes());
+                // Use toByteBuffer(...) which might be able to return the internal ByteBuffer and so reduce
+                // allocations.
+                ByteBuffer out0 = toByteBuffer(out, out.writerIndex(), out.writableBytes());
                 SSLEngineResult result = engine.wrap(in0, out0);
                 in.skipBytes(result.bytesConsumed());
                 out.writerIndex(out.writerIndex() + result.bytesProduced());
@@ -1062,7 +1065,16 @@ public class SslHandler extends ByteToMessageDecoder implements ChannelOutboundH
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         boolean handshakeFailed = handshakePromise.cause() != null;
 
+        // Channel closed, we will generate 'ClosedChannelException' now.
         ClosedChannelException exception = new ClosedChannelException();
+
+        // Add a supressed exception if the handshake was not completed yet.
+        if (isStateSet(STATE_HANDSHAKE_STARTED) && !handshakePromise.isDone()) {
+            ThrowableUtil.addSuppressed(exception, StacklessSSLHandshakeException.newInstance(
+                    "Connection closed while SSL/TLS handshake was in progress",
+                    SslHandler.class, "channelInactive"));
+        }
+
         // Make sure to release SSLEngine,
         // and notify the handshake future if the connection has been closed during handshake.
         setHandshakeFailure(ctx, exception, !isStateSet(STATE_OUTBOUND_CLOSED), isStateSet(STATE_HANDSHAKE_STARTED),

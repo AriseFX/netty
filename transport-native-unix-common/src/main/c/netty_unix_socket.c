@@ -61,7 +61,7 @@ extern int accept4(int sockFd, struct sockaddr* addr, socklen_t* addrlen, int fl
 // see sys/un.h#SUN_LEN, this is modified to allow nul bytes
 #define _UNIX_ADDR_LENGTH(path_len) ((uintptr_t) offsetof(struct sockaddr_un, sun_path) + (uintptr_t) path_len)
 
-static int nettyNonBlockingSocket(int domain, int type, int protocol) {
+int netty_unix_socket_nonBlockingSocket(int domain, int type, int protocol) {
 #ifdef SOCK_NONBLOCK
     return socket(domain, type | SOCK_NONBLOCK, protocol);
 #else
@@ -140,6 +140,18 @@ static jobject createDomainDatagramSocketAddress(JNIEnv* env, const struct socka
     return obj;
 }
 
+static jbyteArray netty_unix_socket_createDomainSocketAddressArray(JNIEnv* env, const struct sockaddr_storage* addr) {
+    struct sockaddr_un* s = (struct sockaddr_un*) addr;
+    int pathLength = strlen(s->sun_path);
+    jbyteArray pathBytes = (*env)->NewByteArray(env, pathLength);
+    if (pathBytes == NULL) {
+        return NULL;
+    }
+
+    (*env)->SetByteArrayRegion(env, pathBytes, 0, pathLength, (jbyte*) &s->sun_path);
+    return pathBytes;
+}
+
 static jsize addressLength(const struct sockaddr_storage* addr) {
     int len = netty_unix_socket_ipAddressLength(addr);
     if (len == 4) {
@@ -214,7 +226,7 @@ static jboolean netty_unix_socket_isIPv6Preferred0(JNIEnv* env, jclass clazz, jb
         return JNI_FALSE;
     }
 
-    int fd = nettyNonBlockingSocket(AF_INET6, SOCK_STREAM, 0);
+    int fd = netty_unix_socket_nonBlockingSocket(AF_INET6, SOCK_STREAM, 0);
     if (fd == -1) {
         return errno == EAFNOSUPPORT ? JNI_FALSE : JNI_TRUE;
     }
@@ -260,7 +272,7 @@ static int netty_unix_socket_setOption0(jint fd, int level, int optname, const v
 }
 
 static jint _socket(JNIEnv* env, jclass clazz, int domain, int type) {
-    int fd = nettyNonBlockingSocket(domain, type, 0);
+    int fd = netty_unix_socket_nonBlockingSocket(domain, type, 0);
     if (fd == -1) {
         return -errno;
     } else if (domain == AF_INET6) {
@@ -663,7 +675,7 @@ static jint netty_unix_socket_accept(JNIEnv* env, jclass clazz, jint fd, jbyteAr
 }
 
 static jbyteArray netty_unix_socket_remoteAddress(JNIEnv* env, jclass clazz, jint fd) {
-    struct sockaddr_storage addr;
+    struct sockaddr_storage addr = { 0 };
     socklen_t len = sizeof(addr);
     if (getpeername(fd, (struct sockaddr*) &addr, &len) == -1) {
         return NULL;
@@ -671,13 +683,31 @@ static jbyteArray netty_unix_socket_remoteAddress(JNIEnv* env, jclass clazz, jin
     return netty_unix_socket_createInetSocketAddressArray(env, &addr);
 }
 
+static jbyteArray netty_unix_socket_remoteDomainSocketAddress(JNIEnv* env, jclass clazz, jint fd) {
+    struct sockaddr_storage addr = { 0 };
+    socklen_t len = sizeof(addr);
+    if (getpeername(fd, (struct sockaddr*) &addr, &len) == -1) {
+        return NULL;
+    }
+    return netty_unix_socket_createDomainSocketAddressArray(env, &addr);
+}
+
 static jbyteArray netty_unix_socket_localAddress(JNIEnv* env, jclass clazz, jint fd) {
-    struct sockaddr_storage addr;
+    struct sockaddr_storage addr = { 0 };
     socklen_t len = sizeof(addr);
     if (getsockname(fd, (struct sockaddr*) &addr, &len) == -1) {
         return NULL;
     }
     return netty_unix_socket_createInetSocketAddressArray(env, &addr);
+}
+
+static jbyteArray netty_unix_socket_localDomainSocketAddress(JNIEnv* env, jclass clazz, jint fd) {
+    struct sockaddr_storage addr = { 0 };
+    socklen_t len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr*) &addr, &len) == -1) {
+        return NULL;
+    }
+    return netty_unix_socket_createDomainSocketAddressArray(env, &addr);
 }
 
 static jint netty_unix_socket_newSocketDgramFd(JNIEnv* env, jclass clazz, jboolean ipv6) {
@@ -691,7 +721,7 @@ static jint netty_unix_socket_newSocketStreamFd(JNIEnv* env, jclass clazz, jbool
 }
 
 static jint netty_unix_socket_newSocketDomainFd(JNIEnv* env, jclass clazz) {
-    int fd = nettyNonBlockingSocket(PF_UNIX, SOCK_STREAM, 0);
+    int fd = netty_unix_socket_nonBlockingSocket(PF_UNIX, SOCK_STREAM, 0);
     if (fd == -1) {
         return -errno;
     }
@@ -699,7 +729,7 @@ static jint netty_unix_socket_newSocketDomainFd(JNIEnv* env, jclass clazz) {
 }
 
 static jint netty_unix_socket_newSocketDomainDgramFd(JNIEnv* env, jclass clazz) {
-    int fd = nettyNonBlockingSocket(PF_UNIX, SOCK_DGRAM, 0);
+    int fd = netty_unix_socket_nonBlockingSocket(PF_UNIX, SOCK_DGRAM, 0);
     if (fd == -1) {
         return -errno;
     }
@@ -813,16 +843,17 @@ static jint netty_unix_socket_bindDomainSocket(JNIEnv* env, jclass clazz, jint f
     jint socket_path_len = (*env)->GetArrayLength(env, socketPath);
 
     if (socket_path_len > sizeof(addr.sun_path) || (socket_path_len == sizeof(addr.sun_path) && socket_path[socket_path_len] != '\0')) {
+        (*env)->ReleaseByteArrayElements(env, socketPath, socket_path, 0);
         return -ENAMETOOLONG;
     }
     memcpy(addr.sun_path, socket_path, socket_path_len);
+    (*env)->ReleaseByteArrayElements(env, socketPath, socket_path, 0);
 
     if (unlink((const char*) addr.sun_path) == -1 && errno != ENOENT) {
         return -errno;
     }
 
     int res = bind(fd, (struct sockaddr*) &addr, _UNIX_ADDR_LENGTH(socket_path_len));
-    (*env)->ReleaseByteArrayElements(env, socketPath, socket_path, 0);
 
     if (res == -1) {
         return -errno;
@@ -841,17 +872,17 @@ static jint netty_unix_socket_connectDomainSocket(JNIEnv* env, jclass clazz, jin
     socket_path_len = (*env)->GetArrayLength(env, socketPath);
 
     if (socket_path_len > sizeof(addr.sun_path) || (socket_path_len == sizeof(addr.sun_path) && socket_path[socket_path_len] != '\0')) {
+        (*env)->ReleaseByteArrayElements(env, socketPath, socket_path, 0);
         return -ENAMETOOLONG;
     }
     memcpy(addr.sun_path, socket_path, socket_path_len);
+    (*env)->ReleaseByteArrayElements(env, socketPath, socket_path, 0);
 
     int res;
     int err;
     do {
         res = connect(fd, (struct sockaddr*) &addr, _UNIX_ADDR_LENGTH(socket_path_len));
     } while (res == -1 && ((err = errno) == EINTR));
-
-    (*env)->ReleaseByteArrayElements(env, socketPath, socket_path, 0);
 
     if (res < 0) {
         return -err;
@@ -1152,6 +1183,8 @@ static const JNINativeMethod fixed_method_table[] = {
   { "accept", "(I[B)I", (void *) netty_unix_socket_accept },
   { "remoteAddress", "(I)[B", (void *) netty_unix_socket_remoteAddress },
   { "localAddress", "(I)[B", (void *) netty_unix_socket_localAddress },
+  { "remoteDomainSocketAddress", "(I)[B", (void *) netty_unix_socket_remoteDomainSocketAddress },
+  { "localDomainSocketAddress", "(I)[B", (void *) netty_unix_socket_localDomainSocketAddress },
   { "newSocketDgramFd", "(Z)I", (void *) netty_unix_socket_newSocketDgramFd },
   { "newSocketStreamFd", "(Z)I", (void *) netty_unix_socket_newSocketStreamFd },
   { "newSocketDomainFd", "()I", (void *) netty_unix_socket_newSocketDomainFd },

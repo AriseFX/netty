@@ -708,7 +708,7 @@ public final class OpenSsl {
         libNames.add(staticLibName);
 
         NativeLibraryLoader.loadFirstAvailable(PlatformDependent.getClassLoader(SSLContext.class),
-            libNames.toArray(new String[0]));
+            libNames.toArray(EmptyArrays.EMPTY_STRINGS));
     }
 
     private static boolean initializeTcNative(String engine) throws Exception {
@@ -723,6 +723,23 @@ public final class OpenSsl {
 
     static boolean isTlsv13Supported() {
         return TLSV13_SUPPORTED;
+    }
+
+    static boolean isOptionSupported(SslContextOption<?> option) {
+        if (isAvailable()) {
+            if (option == OpenSslContextOption.USE_TASKS) {
+                return true;
+            }
+            // Check for options that are only supported by BoringSSL atm.
+            if (isBoringSSL()) {
+                return option == OpenSslContextOption.ASYNC_PRIVATE_KEY_METHOD ||
+                        option == OpenSslContextOption.PRIVATE_KEY_METHOD ||
+                        option == OpenSslContextOption.CERTIFICATE_COMPRESSION_ALGORITHMS ||
+                        option == OpenSslContextOption.TLS_FALSE_START ||
+                        option == OpenSslContextOption.MAX_CERTIFICATE_LIST_BYTES;
+            }
+        }
+        return false;
     }
 
     private static Set<String> protocols(String property) {
@@ -749,7 +766,7 @@ public final class OpenSsl {
                 protocols.add(proto);
             }
         }
-        return protocols.toArray(new String[0]);
+        return protocols.toArray(EmptyArrays.EMPTY_STRINGS);
     }
 
     static boolean isBoringSSL() {

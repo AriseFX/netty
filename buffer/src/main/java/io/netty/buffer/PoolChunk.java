@@ -157,7 +157,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
     /**
      * manage all avail runs
      */
-    private final LongPriorityQueue[] runsAvail;
+    private final IntPriorityQueue[] runsAvail;
 
     private final ReentrantLock runsAvailLock;
 
@@ -231,18 +231,19 @@ final class PoolChunk<T> implements PoolChunkMetric {
         cachedNioBuffers = null;
     }
 
-    private static LongPriorityQueue[] newRunsAvailqueueArray(int size) {
-        LongPriorityQueue[] queueArray = new LongPriorityQueue[size];
+    private static IntPriorityQueue[] newRunsAvailqueueArray(int size) {
+        IntPriorityQueue[] queueArray = new IntPriorityQueue[size];
         for (int i = 0; i < queueArray.length; i++) {
-            queueArray[i] = new LongPriorityQueue();
+            queueArray[i] = new IntPriorityQueue();
         }
         return queueArray;
     }
 
     private void insertAvailRun(int runOffset, int pages, long handle) {
         int pageIdxFloor = arena.pages2pageIdxFloor(pages);
-        LongPriorityQueue queue = runsAvail[pageIdxFloor];
-        queue.offer(handle);
+        IntPriorityQueue queue = runsAvail[pageIdxFloor];
+        assert isRun(handle);
+        queue.offer((int) (handle >> BITMAP_IDX_BIT_LENGTH));
 
         //insert first page of run
         insertAvailRun0(runOffset, handle);
@@ -259,13 +260,11 @@ final class PoolChunk<T> implements PoolChunkMetric {
 
     private void removeAvailRun(long handle) {
         int pageIdxFloor = arena.pages2pageIdxFloor(runPages(handle));
-        LongPriorityQueue queue = runsAvail[pageIdxFloor];
-        removeAvailRun(queue, handle);
+        runsAvail[pageIdxFloor].remove((int) (handle >> BITMAP_IDX_BIT_LENGTH));
+        removeAvailRun0(handle);
     }
 
-    private void removeAvailRun(LongPriorityQueue queue, long handle) {
-        queue.remove(handle);
-
+    private void removeAvailRun0(long handle) {
         int runOffset = runOffset(handle);
         int pages = runPages(handle);
         //remove first page of run
@@ -287,11 +286,15 @@ final class PoolChunk<T> implements PoolChunkMetric {
     @Override
     public int usage() {
         final int freeBytes;
-        arena.lock();
-        try {
+        if (this.unpooled) {
             freeBytes = this.freeBytes;
-        } finally {
-            arena.unlock();
+        } else {
+            runsAvailLock.lock();
+            try {
+                freeBytes = this.freeBytes;
+            } finally {
+                runsAvailLock.unlock();
+            }
         }
         return usage(freeBytes);
     }
@@ -346,16 +349,15 @@ final class PoolChunk<T> implements PoolChunkMetric {
             }
 
             //get run with min offset in this queue
-            LongPriorityQueue queue = runsAvail[queueIdx];
+            IntPriorityQueue queue = runsAvail[queueIdx];
             long handle = queue.poll();
+            assert handle != IntPriorityQueue.NO_VALUE;
+            handle <<= BITMAP_IDX_BIT_LENGTH;
+            assert !isUsed(handle) : "invalid handle: " + handle;
 
-            assert handle != LongPriorityQueue.NO_VALUE && !isUsed(handle) : "invalid handle: " + handle;
+            removeAvailRun0(handle);
 
-            removeAvailRun(queue, handle);
-
-            if (handle != -1) {
-                handle = splitLargeRun(handle, pages);
-            }
+            handle = splitLargeRun(handle, pages);
 
             int pinnedSize = runSize(pageShifts, handle);
             freeBytes -= pinnedSize;
@@ -395,7 +397,7 @@ final class PoolChunk<T> implements PoolChunkMetric {
             return arena.nPSizes - 1;
         }
         for (int i = pageIdx; i < arena.nPSizes; i++) {
-            LongPriorityQueue queue = runsAvail[i];
+            IntPriorityQueue queue = runsAvail[i];
             if (queue != null && !queue.isEmpty()) {
                 return i;
             }
@@ -620,11 +622,14 @@ final class PoolChunk<T> implements PoolChunkMetric {
 
     @Override
     public int freeBytes() {
-        arena.lock();
+        if (this.unpooled) {
+            return freeBytes;
+        }
+        runsAvailLock.lock();
         try {
             return freeBytes;
         } finally {
-            arena.unlock();
+            runsAvailLock.unlock();
         }
     }
 
@@ -635,11 +640,15 @@ final class PoolChunk<T> implements PoolChunkMetric {
     @Override
     public String toString() {
         final int freeBytes;
-        arena.lock();
-        try {
+        if (this.unpooled) {
             freeBytes = this.freeBytes;
-        } finally {
-            arena.unlock();
+        } else {
+            runsAvailLock.lock();
+            try {
+                freeBytes = this.freeBytes;
+            } finally {
+                runsAvailLock.unlock();
+            }
         }
 
         return new StringBuilder()

@@ -20,6 +20,7 @@ package io.netty.buffer;
 import static io.netty.util.internal.ObjectUtil.checkPositiveOrZero;
 
 import io.netty.buffer.PoolArena.SizeClass;
+import io.netty.util.Recycler.EnhancedHandle;
 import io.netty.util.internal.MathUtil;
 import io.netty.util.internal.ObjectPool;
 import io.netty.util.internal.ObjectPool.Handle;
@@ -57,6 +58,8 @@ final class PoolThreadCache {
 
     private final int freeSweepAllocationThreshold;
     private final AtomicBoolean freed = new AtomicBoolean();
+    @SuppressWarnings("unused") // Field is only here for the finalizer.
+    private final FreeOnFinalize freeOnFinalize;
 
     private int allocations;
 
@@ -65,7 +68,7 @@ final class PoolThreadCache {
 
     PoolThreadCache(PoolArena<byte[]> heapArena, PoolArena<ByteBuffer> directArena,
                     int smallCacheSize, int normalCacheSize, int maxCachedBufferCapacity,
-                    int freeSweepAllocationThreshold) {
+                    int freeSweepAllocationThreshold, boolean useFinalizer) {
         checkPositiveOrZero(maxCachedBufferCapacity, "maxCachedBufferCapacity");
         this.freeSweepAllocationThreshold = freeSweepAllocationThreshold;
         this.heapArena = heapArena;
@@ -105,6 +108,7 @@ final class PoolThreadCache {
             throw new IllegalArgumentException("freeSweepAllocationThreshold: "
                     + freeSweepAllocationThreshold + " (expected: > 0)");
         }
+        freeOnFinalize = useFinalizer ? new FreeOnFinalize(this) : null;
     }
 
     private static <T> MemoryRegionCache<T>[] createSubPageCaches(
@@ -201,16 +205,6 @@ final class PoolThreadCache {
         }
     }
 
-    /// TODO: In the future when we move to Java9+ we should use java.lang.ref.Cleaner.
-    @Override
-    protected void finalize() throws Throwable {
-        try {
-            super.finalize();
-        } finally {
-            free(true);
-        }
-    }
-
     /**
      *  Should be called if the Thread that uses this cache is about to exist to release resources out of the cache
      */
@@ -246,7 +240,7 @@ final class PoolThreadCache {
 
     private static void checkCacheMayLeak(MemoryRegionCache<?>[] caches, String type) {
         for (MemoryRegionCache<?> cache : caches) {
-            if (cache.queue.size() > 0) {
+            if (!cache.queue.isEmpty()) {
                 logger.debug("{} memory may leak.", type);
                 return;
             }
@@ -377,7 +371,7 @@ final class PoolThreadCache {
             boolean queued = queue.offer(entry);
             if (!queued) {
                 // If it was not possible to cache the chunk, immediately recycle the entry
-                entry.recycle();
+                entry.unguardedRecycle();
             }
 
             return queued;
@@ -392,7 +386,7 @@ final class PoolThreadCache {
                 return false;
             }
             initBuf(entry.chunk, entry.nioBuffer, entry.handle, buf, reqCapacity, threadCache);
-            entry.recycle();
+            entry.unguardedRecycle();
 
             // allocations is not thread-safe which is fine as this is only called from the same thread all time.
             ++ allocations;
@@ -451,14 +445,14 @@ final class PoolThreadCache {
         }
 
         static final class Entry<T> {
-            final Handle<Entry<?>> recyclerHandle;
+            final EnhancedHandle<Entry<?>> recyclerHandle;
             PoolChunk<T> chunk;
             ByteBuffer nioBuffer;
             long handle = -1;
             int normCapacity;
 
             Entry(Handle<Entry<?>> recyclerHandle) {
-                this.recyclerHandle = recyclerHandle;
+                this.recyclerHandle = (EnhancedHandle<Entry<?>>) recyclerHandle;
             }
 
             void recycle() {
@@ -466,6 +460,13 @@ final class PoolThreadCache {
                 nioBuffer = null;
                 handle = -1;
                 recyclerHandle.recycle(this);
+            }
+
+            void unguardedRecycle() {
+                chunk = null;
+                nioBuffer = null;
+                handle = -1;
+                recyclerHandle.unguardedRecycle(this);
             }
         }
 
@@ -487,5 +488,24 @@ final class PoolThreadCache {
                 return new Entry(handle);
             }
         });
+    }
+
+    private static final class FreeOnFinalize {
+        private final PoolThreadCache cache;
+
+        private FreeOnFinalize(PoolThreadCache cache) {
+            this.cache = cache;
+        }
+
+        /// TODO: In the future when we move to Java9+ we should use java.lang.ref.Cleaner.
+        @SuppressWarnings({"FinalizeDeclaration", "deprecation"})
+        @Override
+        protected void finalize() throws Throwable {
+            try {
+                super.finalize();
+            } finally {
+                cache.free(true);
+            }
+        }
     }
 }
